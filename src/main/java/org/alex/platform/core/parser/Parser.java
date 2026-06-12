@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
 import java.util.HashMap;
+import java.util.List;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -34,9 +35,11 @@ public class Parser implements Node {
 
     private static final Logger LOG = LoggerFactory.getLogger(Parser.class);
     private static final String DEPENDENCY_REGEX = "\\$\\{.+?}";
+    private static final String INNERMOST_DEPENDENCY_REGEX = "\\$\\{[^{}]*}";
     private static final String DEPENDENCY_REGEX_INDEX = "[a-zA-Z]+\\[[0-9]+]";
-    private static final String DEPENDENCY_REGEX_PARAMS = "\\w+\\((,?|(\'.*\')?|\\s?)+\\)$";
+    private static final String DEPENDENCY_REGEX_PARAMS = "\\w+\\(.*\\)$";
     private static final String PROCESSOR_REGEX = "#\\{.+?}";
+    private static final int MAX_RESOLVE_ITERATIONS = 1600;
 
     @Autowired
     InterfaceCaseSuiteService ifSuiteService;
@@ -96,9 +99,13 @@ public class Parser implements Node {
             runEnv = ifSuiteService.findInterfaceCaseSuiteById(suiteId).getRunDev();
         }
         LOG.info("--------------------------------------运行环境={}, 0dev 1test 2stg 3prod 4debug", runEnv);
-        Pattern p = Pattern.compile(DEPENDENCY_REGEX);
+        Pattern p = Pattern.compile(INNERMOST_DEPENDENCY_REGEX);
         Matcher matcher = p.matcher(s);
+        int resolveCount = 0;
         while (matcher.find()) {
+            if (++resolveCount > MAX_RESOLVE_ITERATIONS) {
+                throw new ParseException("dependency resolution exceeded maximum iterations (" + MAX_RESOLVE_ITERATIONS + ")");
+            }
             String findStr = matcher.group();
             String relyName = findStr.substring(2, findStr.length() - 1);
             String relyExpress = relyName; // 带索引的
@@ -220,16 +227,10 @@ public class Parser implements Node {
             } else if (Pattern.matches(DEPENDENCY_REGEX_PARAMS, relyName)) {
                 long start = TimeUtil.now();
                 LOG.info("--------------------------------------进入预置方法/动态SQL模式");
-                if (relyName.indexOf("(") != relyName.lastIndexOf("(") ||
-                        relyName.indexOf(")") != relyName.lastIndexOf(")")) {
-                    String nf = String.format("dependency init method or sql [%s] syntax error", relyName);
-                    LOG.error(nf);
-                    throw new ParseException(nf);
-                }
                 String methodName = relyName.substring(0, relyName.indexOf("("));
                 LOG.info("预置方法名称/动态SQL依赖名称={}", methodName);
-                String[] params = relyName.substring(relyName.indexOf("(") + 1, relyName.length() - 1)
-                        .replaceAll(",\\s+", ",").split(",");
+                String argsContent = relyName.substring(relyName.indexOf("(") + 1, relyName.lastIndexOf(")"));
+                String[] params = splitArgs(argsContent);
                 RelyDataVO relyDataVO = relyDataService.findRelyDataByName(methodName);
                 if (null == relyDataVO) {
                     String nf = String.format("init method or sql [%s] not found", relyName);
@@ -255,7 +256,7 @@ public class Parser implements Node {
                         throw new ParseException(nf);
                     }
 
-                    if (params.length == 1 && "".equals(params[0])) {
+                    if (params.length == 0 || (params.length == 1 && "".equals(params[0]))) {
                         params = new String[0];
                     }
 
@@ -265,7 +266,7 @@ public class Parser implements Node {
                         Class[] paramsList = new Class[params.length];
                         for (int i = 0; i < params.length; i++) {
                             paramsList[i] = String.class;
-                            params[i] = params[i].substring(1, params[i].length() - 1);
+                            params[i] = stripArgQuotes(params[i]);
                         }
                         LOG.info("固定长度参数，方法名称={}，方法参数={}", methodName, Arrays.toString(params));
                         method = clazz.getMethod(methodName, paramsList);
@@ -290,12 +291,12 @@ public class Parser implements Node {
                     s = s.replace(findStr, methodReturnValue);
                 } else if (type >= 2 && type <= 6) { //sql 2sql-select 3sql-insert 4sql-update 5sql-delete 6sql-script
                     LOG.info("--------------------------------------进入动态SQL模式");
-                    if (params.length == 1 && "".equals(params[0])) {
+                    if (params.length == 0 || (params.length == 1 && "".equals(params[0]))) {
                         params = null;
                     } else {
                         for (int i = 0; i < params.length; i++) {
                             // 去除首尾引号
-                            params[i] = params[i].substring(1, params[i].length() - 1);
+                            params[i] = stripArgQuotes(params[i]);
                         }
                     }
                     Integer datasourceId = relyDataVO.getDatasourceId();
@@ -539,6 +540,7 @@ public class Parser implements Node {
                     }
                 }
             }
+            matcher = p.matcher(s);
         }
         return s;
     }
@@ -603,6 +605,50 @@ public class Parser implements Node {
     }
 
     /**
+     * 引号感知的参数分割
+     * 按逗号分割参数字符串，但忽略单引号内的逗号
+     * @param argsStr 参数字符串
+     * @return 分割后的参数数组
+     */
+    private String[] splitArgs(String argsStr) {
+        if (argsStr == null || argsStr.trim().isEmpty()) {
+            return new String[0];
+        }
+        List<String> args = new ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuote = false;
+        for (int i = 0; i < argsStr.length(); i++) {
+            char c = argsStr.charAt(i);
+            if (c == '\'' && (i == 0 || argsStr.charAt(i - 1) != '\\')) {
+                inQuote = !inQuote;
+                current.append(c);
+            } else if (c == ',' && !inQuote) {
+                args.add(current.toString().trim());
+                current = new StringBuilder();
+            } else {
+                current.append(c);
+            }
+        }
+        if (current.length() > 0) {
+            args.add(current.toString().trim());
+        }
+        return args.toArray(new String[0]);
+    }
+
+    /**
+     * 安全去除参数首尾的单引号
+     * 仅当参数以单引号开头且以单引号结尾时才去除，否则原样返回
+     * @param arg 参数字符串
+     * @return 去除引号后的参数
+     */
+    private String stripArgQuotes(String arg) {
+        if (arg != null && arg.length() >= 2 && arg.startsWith("'") && arg.endsWith("'")) {
+            return arg.substring(1, arg.length() - 1);
+        }
+        return arg;
+    }
+
+    /**
      * 提取文本中的依赖(仅名称)
      * @param text 字符串文本
      * @return 依赖名称列表
@@ -612,7 +658,8 @@ public class Parser implements Node {
         if (text != null) {
             // 去除处理器，否则若依赖中包含处理器将解析出错
             text = text.replaceAll(PROCESSOR_REGEX, "");
-            Matcher matcher = Pattern.compile(DEPENDENCY_REGEX).matcher(text);
+            Pattern p = Pattern.compile(INNERMOST_DEPENDENCY_REGEX);
+            Matcher matcher = p.matcher(text);
             while(matcher.find()) {
                 String finds = matcher.group();
                 String dependencyExpression = finds.substring(2, finds.length() - 1);
@@ -625,6 +672,8 @@ public class Parser implements Node {
                 } else { // 普通模式
                     list.add(dependencyExpression);
                 }
+                text = text.replace(finds, "");
+                matcher = p.matcher(text);
             }
         }
         return list;
