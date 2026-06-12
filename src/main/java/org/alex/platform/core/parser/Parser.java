@@ -33,10 +33,14 @@ import java.util.regex.Pattern;
 public class Parser implements Node {
 
     private static final Logger LOG = LoggerFactory.getLogger(Parser.class);
-    private static final String DEPENDENCY_REGEX = "\\$\\{.+?}";
+    /** 匹配最内层 ${...}（内部不含嵌套 ${}），逐层向外展开 */
+    private static final String DEPENDENCY_REGEX = "\\$\\{[^{}]*}";
     private static final String DEPENDENCY_REGEX_INDEX = "[a-zA-Z]+\\[[0-9]+]";
-    private static final String DEPENDENCY_REGEX_PARAMS = "\\w+\\((,?|(\'.*\')?|\\s?)+\\)$";
+    /** 支持引号参数和无引号参数（嵌套解析后内层结果不带引号） */
+    private static final String DEPENDENCY_REGEX_PARAMS = "\\w+\\(.*\\)$";
     private static final String PROCESSOR_REGEX = "#\\{.+?}";
+    /** 嵌套解析最大深度，防止循环引用导致无限递归 */
+    private static final int MAX_NESTING_DEPTH = 10;
 
     @Autowired
     InterfaceCaseSuiteService ifSuiteService;
@@ -62,7 +66,7 @@ public class Parser implements Node {
 
 
     /**
-     * 字符清洗
+     * 字符清洗（公共入口，嵌套深度从 0 开始）
      * @param s 待清洗数据
      * @param chainNo 调用链路跟踪 每次调用均会将自增日志编号写入缓存，再序列化
      * @param suiteId 测试套件编号，主要用于调用入口为测试套件时确定运行环境，否则应该传参null
@@ -77,12 +81,34 @@ public class Parser implements Node {
      * @throws BusinessException BusinessException
      * @throws SqlException SqlException
      */
-
     public String parseDependency(String s, String chainNo, Integer suiteId, Byte isFailedRetry, String suiteLogDetailNo,
                                 HashMap globalHeaders, HashMap globalParams, HashMap globalData, String casePreNo)
             throws ParseException, BusinessException, SqlException {
+        return parseDependency(s, chainNo, suiteId, isFailedRetry, suiteLogDetailNo,
+                globalHeaders, globalParams, globalData, casePreNo, 0);
+    }
+
+    /**
+     * 字符清洗（内部实现，带嵌套深度保护）
+     * <p>
+     * 嵌套解析策略：使用正则 {@code \$\{[^{}]*}} 只匹配最内层（不包含嵌套 ${}）的表达式，
+     * 每次解析替换一个最内层表达式后重新扫描，逐层向外展开，直到字符串中不再有 ${...}。
+     * 例如 {@code ${md5(${timestamp})}} 会先解析 {@code ${timestamp}}，
+     * 替换后变成 {@code ${md5(1234567890)}}，再次扫描时解析外层。
+     * </p>
+     */
+    @SuppressWarnings("unchecked")
+    private String parseDependency(String s, String chainNo, Integer suiteId, Byte isFailedRetry, String suiteLogDetailNo,
+                                HashMap globalHeaders, HashMap globalParams, HashMap globalData, String casePreNo,
+                                int depth)
+            throws ParseException, BusinessException, SqlException {
         if (s == null || s.isEmpty()) {
             return s;
+        }
+        if (depth > MAX_NESTING_DEPTH) {
+            String nf = String.format("dependency nesting depth exceeds maximum (%d), possible circular reference in: %s", MAX_NESTING_DEPTH, s);
+            LOG.error(nf);
+            throw new ParseException(nf);
         }
         // 解析处理器
         s = parseProcessor(s, suiteLogDetailNo, casePreNo, chainNo);
@@ -96,9 +122,14 @@ public class Parser implements Node {
             runEnv = ifSuiteService.findInterfaceCaseSuiteById(suiteId).getRunDev();
         }
         LOG.info("--------------------------------------运行环境={}, 0dev 1test 2stg 3prod 4debug", runEnv);
+
+        // 逐层从最内层 ${...} 向外展开解析
         Pattern p = Pattern.compile(DEPENDENCY_REGEX);
-        Matcher matcher = p.matcher(s);
-        while (matcher.find()) {
+        while (true) {
+            Matcher matcher = p.matcher(s);
+            if (!matcher.find()) {
+                break; // 没有更多 ${...} 表达式，解析完成
+            }
             String findStr = matcher.group();
             String relyName = findStr.substring(2, findStr.length() - 1);
             String relyExpress = relyName; // 带索引的
@@ -220,16 +251,17 @@ public class Parser implements Node {
             } else if (Pattern.matches(DEPENDENCY_REGEX_PARAMS, relyName)) {
                 long start = TimeUtil.now();
                 LOG.info("--------------------------------------进入预置方法/动态SQL模式");
-                if (relyName.indexOf("(") != relyName.lastIndexOf("(") ||
-                        relyName.indexOf(")") != relyName.lastIndexOf(")")) {
+                // 使用第一个 ( 和最后一个 ) 拆分方法名与参数，兼容参数值中含括号的情况
+                int firstParen = relyName.indexOf("(");
+                if (!relyName.endsWith(")") || firstParen == -1) {
                     String nf = String.format("dependency init method or sql [%s] syntax error", relyName);
                     LOG.error(nf);
                     throw new ParseException(nf);
                 }
-                String methodName = relyName.substring(0, relyName.indexOf("("));
+                String methodName = relyName.substring(0, firstParen);
                 LOG.info("预置方法名称/动态SQL依赖名称={}", methodName);
-                String[] params = relyName.substring(relyName.indexOf("(") + 1, relyName.length() - 1)
-                        .replaceAll(",\\s+", ",").split(",");
+                String rawParamsStr = relyName.substring(firstParen + 1, relyName.length() - 1);
+                String[] params = splitParams(rawParamsStr);
                 RelyDataVO relyDataVO = relyDataService.findRelyDataByName(methodName);
                 if (null == relyDataVO) {
                     String nf = String.format("init method or sql [%s] not found", relyName);
@@ -255,8 +287,9 @@ public class Parser implements Node {
                         throw new ParseException(nf);
                     }
 
-                    if (params.length == 1 && "".equals(params[0])) {
-                        params = new String[0];
+                    // 去除每个参数两端的单引号（如果有），使嵌套解析产生的无引号值也能正确传入
+                    for (int i = 0; i < params.length; i++) {
+                        params[i] = stripQuotes(params[i]);
                     }
 
                     try { // 尝试固定长度参数
@@ -265,7 +298,6 @@ public class Parser implements Node {
                         Class[] paramsList = new Class[params.length];
                         for (int i = 0; i < params.length; i++) {
                             paramsList[i] = String.class;
-                            params[i] = params[i].substring(1, params[i].length() - 1);
                         }
                         LOG.info("固定长度参数，方法名称={}，方法参数={}", methodName, Arrays.toString(params));
                         method = clazz.getMethod(methodName, paramsList);
@@ -294,8 +326,8 @@ public class Parser implements Node {
                         params = null;
                     } else {
                         for (int i = 0; i < params.length; i++) {
-                            // 去除首尾引号
-                            params[i] = params[i].substring(1, params[i].length() - 1);
+                            // 去除首尾引号（如果有）
+                            params[i] = stripQuotes(params[i]);
                         }
                     }
                     Integer datasourceId = relyDataVO.getDatasourceId();
@@ -319,7 +351,7 @@ public class Parser implements Node {
                     String sql = relyDataVO.getValue();
                     if (relyDataVO.getValue() != null) {
                         LOG.info("开始解析SQL，解析前SQL={}", sql);
-                        sql = parseDependency(sql, chainNo, suiteId, isFailedRetry, suiteLogDetailNo, globalHeaders, globalParams, globalData, casePreNo);
+                        sql = parseDependency(sql, chainNo, suiteId, isFailedRetry, suiteLogDetailNo, globalHeaders, globalParams, globalData, casePreNo, depth + 1);
                         LOG.info("解析SQL完成，解析后SQL={}", sql);
                     }
                     LOG.info("SQL执行参数，SQL={}, params={}", sql, params);
@@ -405,7 +437,7 @@ public class Parser implements Node {
                             String sql = relyDataVO.getValue();
                             if (relyDataVO.getValue() != null) {
                                 LOG.info("开始解析SQL，解析前SQL={}", sql);
-                                sql = parseDependency(sql, chainNo, suiteId, isFailedRetry, suiteLogDetailNo, globalHeaders, globalParams, globalData, casePreNo);
+                                sql = parseDependency(sql, chainNo, suiteId, isFailedRetry, suiteLogDetailNo, globalHeaders, globalParams, globalData, casePreNo, depth + 1);
                                 LOG.info("解析SQL完成，解析后SQL={}", sql);
                             }
                             LOG.info("SQL执行参数，SQL={}", sql);
@@ -603,7 +635,54 @@ public class Parser implements Node {
     }
 
     /**
-     * 提取文本中的依赖(仅名称)
+     * 拆分方法/SQL 参数列表，尊重单引号内的逗号与括号。
+     * <p>例：{@code "'hello, world',foo,'bar'"} → {@code ["'hello, world'", "foo", "'bar'"]}</p>
+     *
+     * @param paramsStr 括号内的原始参数串
+     * @return 拆分后的参数数组；空串或 null 返回零长度数组
+     */
+    private String[] splitParams(String paramsStr) {
+        if (paramsStr == null || paramsStr.trim().isEmpty()) {
+            return new String[0];
+        }
+        java.util.List<String> params = new java.util.ArrayList<>();
+        StringBuilder current = new StringBuilder();
+        boolean inQuote = false;
+        for (int i = 0; i < paramsStr.length(); i++) {
+            char c = paramsStr.charAt(i);
+            if (c == '\'') {
+                inQuote = !inQuote;
+                current.append(c);
+            } else if (c == ',' && !inQuote) {
+                params.add(current.toString().trim());
+                current = new StringBuilder();
+            } else {
+                current.append(c);
+            }
+        }
+        if (current.length() > 0) {
+            params.add(current.toString().trim());
+        }
+        return params.toArray(new String[0]);
+    }
+
+    /**
+     * 去除参数两端的单引号（如果存在）。
+     * 嵌套解析后内层结果不带引号，直接返回原值。
+     *
+     * @param param 原始参数值
+     * @return 去引号后的值
+     */
+    private String stripQuotes(String param) {
+        if (param != null && param.length() >= 2 && param.startsWith("'") && param.endsWith("'")) {
+            return param.substring(1, param.length() - 1);
+        }
+        return param;
+    }
+
+    /**
+     * 提取文本中的依赖(仅名称)，支持嵌套 ${} 表达式。
+     * 逐层从最内层向外提取所有依赖名称。
      * @param text 字符串文本
      * @return 依赖名称列表
      */
@@ -612,19 +691,30 @@ public class Parser implements Node {
         if (text != null) {
             // 去除处理器，否则若依赖中包含处理器将解析出错
             text = text.replaceAll(PROCESSOR_REGEX, "");
-            Matcher matcher = Pattern.compile(DEPENDENCY_REGEX).matcher(text);
-            while(matcher.find()) {
-                String finds = matcher.group();
-                String dependencyExpression = finds.substring(2, finds.length() - 1);
-                if (Pattern.matches(DEPENDENCY_REGEX_INDEX, dependencyExpression)) { // 数组下标 带[]
-                    String dependencyName = dependencyExpression.substring(0, dependencyExpression.indexOf("["));
-                    list.add(dependencyName);
-                } else if (Pattern.matches(DEPENDENCY_REGEX_PARAMS, dependencyExpression)) { // 方法或者sql 带（）
-                    String dependencyName = dependencyExpression.substring(0, dependencyExpression.indexOf("("));
-                    list.add(dependencyName);
-                } else { // 普通模式
-                    list.add(dependencyExpression);
+            // 逐层从最内层 ${...} 向外提取依赖名称
+            Pattern innermost = Pattern.compile(DEPENDENCY_REGEX);
+            while (true) {
+                Matcher matcher = innermost.matcher(text);
+                boolean found = false;
+                while (matcher.find()) {
+                    found = true;
+                    String finds = matcher.group();
+                    String dependencyExpression = finds.substring(2, finds.length() - 1);
+                    if (Pattern.matches(DEPENDENCY_REGEX_INDEX, dependencyExpression)) { // 数组下标 带[]
+                        String dependencyName = dependencyExpression.substring(0, dependencyExpression.indexOf("["));
+                        list.add(dependencyName);
+                    } else if (Pattern.matches(DEPENDENCY_REGEX_PARAMS, dependencyExpression)) { // 方法或者sql 带（）
+                        String dependencyName = dependencyExpression.substring(0, dependencyExpression.indexOf("("));
+                        list.add(dependencyName);
+                    } else { // 普通模式
+                        list.add(dependencyExpression);
+                    }
                 }
+                if (!found) {
+                    break;
+                }
+                // 将当前层的 ${...} 替换为占位符，继续提取外层
+                text = innermost.matcher(text).replaceAll("__NESTED_PLACEHOLDER__");
             }
         }
         return list;
